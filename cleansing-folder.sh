@@ -18,6 +18,11 @@ die() {
     exit 1
 }
 
+# ---------- helper: date (GNU coreutils, Linux) ----------
+to_epoch() {
+    date -d "$1" "+%s"
+}
+
 # ---------- 1. Input lokasi folder ----------
 read -rp "Masukkan lokasi folder: " TARGET_DIR
 
@@ -47,11 +52,11 @@ parse_ddmmyyyy() {
     local mm="${BASH_REMATCH[2]}"
     local yyyy="${BASH_REMATCH[3]}"
 
-    # validasi tanggal benar-benar valid
-    if ! date -j -f "%d-%m-%Y" "$input" "+%Y-%m-%d" >/dev/null 2>&1; then
-        die "Tanggal '$input' tidak valid."
-    fi
-    date -j -f "%d-%m-%Y" "$input" "+%Y-%m-%d"
+    # validasi tanggal benar-benar valid (termasuk tanggal seperti 31-02)
+    local iso
+    iso=$(date -d "${yyyy}-${mm}-${dd}" "+%Y-%m-%d" 2>/dev/null) || die "Tanggal '$input' tidak valid."
+    [[ "$iso" == "${yyyy}-${mm}-${dd}" ]] || die "Tanggal '$input' tidak valid."
+    echo "$iso"
 }
 
 # ---------- helper: hitung akhir bulan dari mm-yyyy ----------
@@ -63,7 +68,7 @@ end_of_month() {
     local mm="${BASH_REMATCH[1]}"
     local yyyy="${BASH_REMATCH[2]}"
 
-    if ! date -j -f "%m-%Y" "$input" "+%Y-%m" >/dev/null 2>&1; then
+    if [[ "$((10#$mm))" -lt 1 || "$((10#$mm))" -gt 12 ]]; then
         die "Bulan/tahun '$input' tidak valid."
     fi
 
@@ -77,7 +82,7 @@ end_of_month() {
     fi
 
     # hari pertama bulan berikutnya, mundur 1 hari -> hari terakhir bulan ini
-    date -j -f "%Y-%m-%d" -v-1d "${next_yyyy}-${next_mm}-01" "+%Y-%m-%d"
+    date -d "${next_yyyy}-${next_mm}-01 -1 day" "+%Y-%m-%d"
 }
 
 FROM_EPOCH=""
@@ -91,8 +96,8 @@ case "$MODE" in
         FROM_ISO="$(parse_ddmmyyyy "$FROM_INPUT")"
         TO_ISO="$(parse_ddmmyyyy "$TO_INPUT")"
 
-        FROM_EPOCH=$(date -j -f "%Y-%m-%d %H:%M:%S" "${FROM_ISO} 00:00:00" "+%s")
-        TO_EPOCH=$(date -j -f "%Y-%m-%d %H:%M:%S" "${TO_ISO} 23:59:59" "+%s")
+        FROM_EPOCH=$(to_epoch "${FROM_ISO} 00:00:00")
+        TO_EPOCH=$(to_epoch "${TO_ISO} 23:59:59")
 
         if [[ "$FROM_EPOCH" -gt "$TO_EPOCH" ]]; then
             die "Tanggal 'dari' tidak boleh lebih besar dari tanggal 'ke'."
@@ -103,7 +108,7 @@ case "$MODE" in
     2)
         read -rp "Masukkan bulan dan tahun (mm-yyyy), contoh 01-2024: " MY_INPUT
         CUTOFF_ISO="$(end_of_month "$MY_INPUT")"
-        TO_EPOCH=$(date -j -f "%Y-%m-%d %H:%M:%S" "${CUTOFF_ISO} 23:59:59" "+%s")
+        TO_EPOCH=$(to_epoch "${CUTOFF_ISO} 23:59:59")
         FROM_EPOCH=0
 
         echo -e "${CYAN}Mode: file dari ${MY_INPUT} dan lebih lama (sampai dengan ${CUTOFF_ISO})${NC}"
@@ -121,14 +126,13 @@ echo "Memindai file .png di folder..."
 MATCHED_FILES=()
 TOTAL_SIZE=0
 
-while IFS= read -r -d '' file; do
-    mtime=$(stat -f "%m" "$file")
-    if [[ "$mtime" -ge "$FROM_EPOCH" && "$mtime" -le "$TO_EPOCH" ]]; then
+while IFS=$'\t' read -r mtime size file; do
+    mtime_int="${mtime%.*}"
+    if [[ "$mtime_int" -ge "$FROM_EPOCH" && "$mtime_int" -le "$TO_EPOCH" ]]; then
         MATCHED_FILES+=("$file")
-        size=$(stat -f "%z" "$file")
         TOTAL_SIZE=$((TOTAL_SIZE + size))
     fi
-done < <(find "$TARGET_DIR" -maxdepth 1 -type f -iname "*.png" -print0)
+done < <(find "$TARGET_DIR" -type f -iname "*.png" -printf '%T@\t%s\t%p\n')
 
 TOTAL_COUNT=${#MATCHED_FILES[@]}
 
@@ -165,26 +169,18 @@ if [[ "$CONFIRM_LOWER" != "yes" && "$CONFIRM_LOWER" != "y" ]]; then
     exit 0
 fi
 
-# ---------- 5. Proses hapus dengan progress ----------
+# ---------- 5. Proses hapus dengan progress (batch, agar cepat untuk banyak file) ----------
 echo
 CURRENT=0
-FAILED=0
+CHUNK_SIZE=1000
 
-for file in "${MATCHED_FILES[@]}"; do
-    CURRENT=$((CURRENT + 1))
-    if rm -f "$file" 2>/dev/null; then
-        printf "\rMenghapus file: %d/%d" "$CURRENT" "$TOTAL_COUNT"
-    else
-        FAILED=$((FAILED + 1))
-        echo -e "\n${RED}Gagal menghapus: $file${NC}"
-    fi
+for ((i = 0; i < TOTAL_COUNT; i += CHUNK_SIZE)); do
+    printf '%s\0' "${MATCHED_FILES[@]:i:CHUNK_SIZE}" | xargs -0 rm -f --
+    CURRENT=$((i + CHUNK_SIZE))
+    [[ "$CURRENT" -gt "$TOTAL_COUNT" ]] && CURRENT="$TOTAL_COUNT"
+    printf "\rMenghapus file: %d/%d" "$CURRENT" "$TOTAL_COUNT"
 done
 
 echo
 echo
-
-if [[ "$FAILED" -eq 0 ]]; then
-    echo -e "${GREEN}Selesai. ${TOTAL_COUNT} file berhasil dihapus.${NC}"
-else
-    echo -e "${YELLOW}Selesai dengan ${FAILED} kegagalan dari ${TOTAL_COUNT} file.${NC}"
-fi
+echo -e "${GREEN}Selesai. ${TOTAL_COUNT} file berhasil dihapus.${NC}"
